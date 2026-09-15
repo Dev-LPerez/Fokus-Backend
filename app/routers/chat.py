@@ -24,6 +24,12 @@ async def chat_endpoint(
     If stream=True, returns SSE stream (text/event-stream).
     If stream=False, returns standard JSON ChatResponse.
     """
+    user_location = {
+        "city": request.city,
+        "latitude": request.latitude,
+        "longitude": request.longitude
+    }
+
     if stream:
         async def event_generator():
             try:
@@ -31,7 +37,8 @@ async def chat_endpoint(
                     message_text=request.message,
                     conversation_id=request.conversation_id,
                     db=db,
-                    user_id=current_user
+                    user_id=current_user,
+                    user_location=user_location
                 ):
                     event_type = event.get("event", "message")
                     data_str = json.dumps(event.get("data", {}), ensure_ascii=False)
@@ -58,7 +65,8 @@ async def chat_endpoint(
                 message_text=request.message,
                 conversation_id=request.conversation_id,
                 db=db,
-                user_id=current_user
+                user_id=current_user,
+                user_location=user_location
             )
             return ChatResponse(
                 conversation_id=result["conversation_id"],

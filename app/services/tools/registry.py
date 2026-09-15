@@ -13,6 +13,7 @@ from .calendar_agenda import (
     FindFreeWorkSlotsTool,
     ScheduleDeepWorkTool
 )
+from .user_profile import SetUserLocationTool
 
 
 class ToolRegistry:
@@ -28,6 +29,7 @@ class ToolRegistry:
         self.register(GetCalendarAgendaTool())
         self.register(FindFreeWorkSlotsTool())
         self.register(ScheduleDeepWorkTool())
+        self.register(SetUserLocationTool())
 
     def register(self, tool: BaseTool) -> None:
         self._tools[tool.name] = tool

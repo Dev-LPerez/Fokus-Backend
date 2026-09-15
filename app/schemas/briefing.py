@@ -10,3 +10,8 @@ class BriefingResponse(BaseModel):
     critical_tasks: List[Dict[str, Any]]
     pending_tasks_count: int
     free_slots_summary: str
+    conflicts: List[Dict[str, Any]] = []
+    has_conflicts: bool = False
+    overdue_tasks: List[Dict[str, Any]] = []
+    total_overdue_tasks: int = 0
+

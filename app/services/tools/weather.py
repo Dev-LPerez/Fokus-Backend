@@ -56,7 +56,9 @@ class WeatherTool(BaseTool):
         else:
             return {
                 "error": "Debes proporcionar una ciudad o coordenadas (latitud y longitud) para consultar el clima.",
-                "status": "missing_location"
+                "status": "missing_location",
+                "location_required": True,
+                "city": None
             }
 
         try:

@@ -217,16 +217,91 @@ class GoogleCalendarService:
 
             start_val = start_obj.get("dateTime") or start_obj.get("date")
             end_val = end_obj.get("dateTime") or end_obj.get("date")
+            summ = item.get("summary", "Sin título") or "Sin título"
+            desc = item.get("description", "") or ""
+
+            # Key meeting heuristics
+            is_key_meeting = False
+            priority_reasons = []
+            lower_comb = f"{summ} {desc}".lower()
+            if any(platform in lower_comb for platform in ["meet.google.com", "zoom.us", "teams.microsoft.com", "webex.com"]):
+                is_key_meeting = True
+                priority_reasons.append("Videollamada con enlace")
+
+            key_keywords = ["cliente", "client", "demo", "entrevista", "interview", "comité", "junta", "directiva", "review", "1:1", "one-on-one", "lanzamiento", "urgente", "evaluación"]
+            for kw in key_keywords:
+                if kw in lower_comb:
+                    is_key_meeting = True
+                    priority_reasons.append(f"Palabra clave: '{kw}'")
+                    break
 
             events.append({
                 "id": item.get("id"),
-                "summary": item.get("summary", "Sin título"),
+                "summary": summ,
                 "start": start_val,
                 "end": end_val,
-                "description": item.get("description", "")
+                "description": desc,
+                "is_key_meeting": is_key_meeting,
+                "priority_reasons": priority_reasons
             })
 
         return events
+
+    def detect_conflicts(self, events: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """
+        Detects overlapping events in the provided list of events.
+        Returns a list of conflict objects with event pairs and overlap intervals.
+        """
+        parsed_events = []
+        for ev in events:
+            raw_start = ev.get("start")
+            raw_end = ev.get("end")
+            if not raw_start or not raw_end:
+                continue
+            try:
+                if len(raw_start) == 10:
+                    start_dt = datetime.combine(date.fromisoformat(raw_start), time.min).replace(tzinfo=COLOMBIA_TZ)
+                else:
+                    start_dt = datetime.fromisoformat(raw_start)
+                    start_dt = start_dt.replace(tzinfo=COLOMBIA_TZ) if start_dt.tzinfo is None else start_dt.astimezone(COLOMBIA_TZ)
+
+                if len(raw_end) == 10:
+                    end_dt = datetime.combine(date.fromisoformat(raw_end), time.max).replace(tzinfo=COLOMBIA_TZ)
+                else:
+                    end_dt = datetime.fromisoformat(raw_end)
+                    end_dt = end_dt.replace(tzinfo=COLOMBIA_TZ) if end_dt.tzinfo is None else end_dt.astimezone(COLOMBIA_TZ)
+
+                parsed_events.append({
+                    "id": ev.get("id"),
+                    "summary": ev.get("summary", "Sin título"),
+                    "start_dt": start_dt,
+                    "end_dt": end_dt,
+                    "start_str": ev.get("start"),
+                    "end_str": ev.get("end")
+                })
+            except Exception:
+                continue
+
+        conflicts = []
+        n = len(parsed_events)
+        for i in range(n):
+            for j in range(i + 1, n):
+                ev1 = parsed_events[i]
+                ev2 = parsed_events[j]
+                overlap_start = max(ev1["start_dt"], ev2["start_dt"])
+                overlap_end = min(ev1["end_dt"], ev2["end_dt"])
+                if overlap_start < overlap_end:
+                    overlap_minutes = int((overlap_end - overlap_start).total_seconds() / 60)
+                    if overlap_minutes > 0:
+                        conflicts.append({
+                            "event_a": {"id": ev1["id"], "summary": ev1["summary"], "start": ev1["start_str"], "end": ev1["end_str"]},
+                            "event_b": {"id": ev2["id"], "summary": ev2["summary"], "start": ev2["start_str"], "end": ev2["end_str"]},
+                            "overlap_start": overlap_start.strftime("%Y-%m-%d %H:%M"),
+                            "overlap_end": overlap_end.strftime("%Y-%m-%d %H:%M"),
+                            "overlap_minutes": overlap_minutes,
+                            "warning": f"Conflicto de horario entre '{ev1['summary']}' y '{ev2['summary']}' ({overlap_minutes} min de cruce)."
+                        })
+        return conflicts
 
     async def find_free_slots(
         self,
@@ -236,11 +311,13 @@ class GoogleCalendarService:
         db: Optional[AsyncSession] = None,
         workday_start_hour: int = 8,
         workday_end_hour: int = 19,
+        buffer_minutes: int = 0,
         events: Optional[List[Dict[str, Any]]] = None
     ) -> List[Dict[str, Any]]:
         """
         Calculates free time blocks between workday_start_hour and workday_end_hour
         for target_date that meet or exceed min_duration_minutes.
+        Optional buffer_minutes applies margin between busy intervals.
         """
         # Ensure target_date is a date object
         if isinstance(target_date, str):
@@ -298,12 +375,20 @@ class GoogleCalendarService:
             except Exception:
                 continue
 
+            # Apply smart buffer if requested
+            if buffer_minutes > 0:
+                buffered_start = start_dt - timedelta(minutes=buffer_minutes)
+                buffered_end = end_dt + timedelta(minutes=buffer_minutes)
+            else:
+                buffered_start = start_dt
+                buffered_end = end_dt
+
             # Clip interval to workday bounds
-            if end_dt <= day_start or start_dt >= day_end:
+            if buffered_end <= day_start or buffered_start >= day_end:
                 continue
 
-            clamped_start = max(day_start, start_dt)
-            clamped_end = min(day_end, end_dt)
+            clamped_start = max(day_start, buffered_start)
+            clamped_end = min(day_end, buffered_end)
 
             if clamped_start < clamped_end:
                 busy_intervals.append((clamped_start, clamped_end))

@@ -6,6 +6,9 @@ from uuid import UUID
 class ChatRequest(BaseModel):
     message: str = Field(..., min_length=1, description="The user prompt or question")
     conversation_id: Optional[UUID] = Field(None, description="Optional conversation ID to resume")
+    city: Optional[str] = Field(None, description="Optional current city of the user")
+    latitude: Optional[float] = Field(None, description="Optional current latitude of the user")
+    longitude: Optional[float] = Field(None, description="Optional current longitude of the user")
 
 
 class ToolCallInfo(BaseModel):

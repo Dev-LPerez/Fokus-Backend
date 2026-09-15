@@ -7,6 +7,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.timezone import COLOMBIA_TZ, get_colombia_now
 from app.db.session import AsyncSessionLocal
 from app.models.reminder import Reminder
+from app.models.user_preference import UserPreference
 from app.services.google_calendar import (
     google_calendar_service,
     GoogleCalendarNotConnected,
@@ -28,7 +29,7 @@ def _parse_target_date(date_str: Optional[str]) -> date:
 
 class GetCalendarAgendaTool(BaseTool):
     name = "get_calendar_agenda"
-    description = "Consulta y retorna los eventos y reuniones programadas en Google Calendar para un día determinado (por defecto la fecha actual)."
+    description = "Consulta y retorna los eventos y reuniones programadas en Google Calendar para un día determinado, detectando solapamientos (conflictos) y reuniones prioritarias/clave."
     parameters = {
         "type": "object",
         "properties": {
@@ -65,11 +66,57 @@ class GetCalendarAgendaTool(BaseTool):
                     time_max=day_end,
                     db=session
                 )
+                now_col = get_colombia_now()
+                is_today = (target_date == now_col.date())
+                tomorrow_date = (target_date + timedelta(days=1)).isoformat()
+
+                enriched_events = []
+                for ev in events:
+                    ev_copy = dict(ev)
+                    if is_today:
+                        end_val = ev.get("end")
+                        start_val = ev.get("start")
+                        try:
+                            if end_val and len(end_val) > 10:
+                                end_dt = datetime.fromisoformat(end_val)
+                                if end_dt.tzinfo is None:
+                                    end_dt = end_dt.replace(tzinfo=COLOMBIA_TZ)
+                                else:
+                                    end_dt = end_dt.astimezone(COLOMBIA_TZ)
+
+                                start_dt = None
+                                if start_val and len(start_val) > 10:
+                                    start_dt = datetime.fromisoformat(start_val)
+                                    if start_dt.tzinfo is None:
+                                        start_dt = start_dt.replace(tzinfo=COLOMBIA_TZ)
+                                    else:
+                                        start_dt = start_dt.astimezone(COLOMBIA_TZ)
+
+                                if end_dt <= now_col:
+                                    ev_copy["time_status"] = "past"
+                                elif start_dt and start_dt <= now_col < end_dt:
+                                    ev_copy["time_status"] = "in_progress"
+                                else:
+                                    ev_copy["time_status"] = "upcoming"
+                        except Exception:
+                            pass
+                    enriched_events.append(ev_copy)
+
+                conflicts = google_calendar_service.detect_conflicts(enriched_events)
+                key_meetings = [ev for ev in enriched_events if ev.get("is_key_meeting")]
+
                 return {
                     "success": True,
                     "date": target_date.isoformat(),
-                    "total_events": len(events),
-                    "events": events
+                    "is_today": is_today,
+                    "current_time": now_col.strftime("%H:%M") if is_today else None,
+                    "total_events": len(enriched_events),
+                    "events": enriched_events,
+                    "key_meetings": key_meetings,
+                    "total_key_meetings": len(key_meetings),
+                    "conflicts": conflicts,
+                    "has_conflicts": len(conflicts) > 0,
+                    "suggested_next_date": tomorrow_date if is_today else None
                 }
             except GoogleCalendarNotConnected:
                 return {
@@ -93,7 +140,7 @@ class GetCalendarAgendaTool(BaseTool):
 
 class FindFreeWorkSlotsTool(BaseTool):
     name = "find_free_work_slots"
-    description = "Calcula los bloques de tiempo libres en la jornada laboral del usuario para agendar trabajo o llamadas sin generar colisiones."
+    description = "Calcula los bloques de tiempo libres en la jornada laboral del usuario para agendar trabajo o llamadas sin generar colisiones. Si se consulta para hoy, tiene en cuenta la hora de la consulta, descarta bloques que ya pasaron, aplica descansos/smart buffers y sugiere evaluar el día siguiente si no hay disponibilidad."
     parameters = {
         "type": "object",
         "properties": {
@@ -104,6 +151,10 @@ class FindFreeWorkSlotsTool(BaseTool):
             "duration_minutes": {
                 "type": "integer",
                 "description": "Duración mínima en minutos requerida para los bloques libres (por defecto 60)."
+            },
+            "buffer_minutes": {
+                "type": "integer",
+                "description": "Minutos de descanso/margen entre reuniones (ej. 10 o 15 minutos). Opcional."
             }
         },
         "required": []
@@ -113,6 +164,7 @@ class FindFreeWorkSlotsTool(BaseTool):
         self,
         date_str: Optional[str] = None,
         duration_minutes: int = 60,
+        buffer_minutes: Optional[int] = None,
         db: Optional[AsyncSession] = None,
         user_id: Optional[UUID] = None,
         **kwargs: Any
@@ -127,18 +179,116 @@ class FindFreeWorkSlotsTool(BaseTool):
 
         async def _run(session: AsyncSession) -> Dict[str, Any]:
             try:
+                # Cargar preferencias de jornada si existen
+                effective_buffer = buffer_minutes if buffer_minutes is not None else 0
+                workday_start = 8
+                workday_end = 19
+
+                try:
+                    pref_stmt = select(UserPreference).where(UserPreference.user_id == user_id)
+                    pref_res = await session.execute(pref_stmt)
+                    user_pref = pref_res.scalar_one_or_none()
+                    if user_pref:
+                        if buffer_minutes is None:
+                            effective_buffer = user_pref.buffer_minutes or 0
+                        workday_start = user_pref.workday_start_hour or 8
+                        workday_end = user_pref.workday_end_hour or 19
+                except Exception as e:
+                    logger.warning(f"No se pudieron cargar preferencias de usuario: {e}")
+
                 slots = await google_calendar_service.find_free_slots(
                     user_id=user_id,
                     target_date=target_date,
                     min_duration_minutes=duration_minutes,
+                    workday_start_hour=workday_start,
+                    workday_end_hour=workday_end,
+                    buffer_minutes=effective_buffer,
                     db=session
                 )
+                now_col = get_colombia_now()
+                is_today = (target_date == now_col.date())
+                tomorrow_date = (target_date + timedelta(days=1)).isoformat()
+
+                if not is_today:
+                    return {
+                        "success": True,
+                        "date": target_date.isoformat(),
+                        "is_today": False,
+                        "min_duration_minutes": duration_minutes,
+                        "total_slots": len(slots),
+                        "free_slots": slots
+                    }
+
+                available_slots = []
+                past_slots = []
+
+                for slot in slots:
+                    try:
+                        s_dt = datetime.strptime(slot["start"], "%Y-%m-%d %H:%M").replace(tzinfo=COLOMBIA_TZ)
+                        e_dt = datetime.strptime(slot["end"], "%Y-%m-%d %H:%M").replace(tzinfo=COLOMBIA_TZ)
+
+                        if e_dt <= now_col:
+                            # Slot completamente en el pasado
+                            past_slots.append({
+                                **slot,
+                                "status": "past",
+                                "note": "Este horario ya transcurrió."
+                            })
+                        elif s_dt < now_col < e_dt:
+                            # Slot en curso
+                            rem_minutes = int((e_dt - now_col).total_seconds() / 60)
+                            if rem_minutes >= duration_minutes:
+                                available_slots.append({
+                                    "start": now_col.strftime("%Y-%m-%d %H:%M"),
+                                    "end": slot["end"],
+                                    "duration_minutes": rem_minutes,
+                                    "original_start": slot["start"],
+                                    "status": "in_progress",
+                                    "note": f"Hueco en curso con {rem_minutes} minutos disponibles restantes."
+                                })
+                            else:
+                                past_slots.append({
+                                    **slot,
+                                    "status": "insufficient_remaining_time",
+                                    "remaining_minutes": rem_minutes,
+                                    "note": f"Tiempo restante ({rem_minutes} min) inferior al mínimo de {duration_minutes} min."
+                                })
+                        else:
+                            # Slot futuro en el día de hoy
+                            available_slots.append({
+                                **slot,
+                                "status": "future_available"
+                            })
+                    except Exception:
+                        available_slots.append(slot)
+
+                day_ended = (len(available_slots) == 0)
+                current_time_str = now_col.strftime("%H:%M")
+
+                if day_ended:
+                    note = (
+                        f"Hora de la consulta: {current_time_str}. Todos los huecos de la jornada de hoy ({len(past_slots)} bloques) "
+                        f"ya pasaron o la jornada concluyó. Ya no es posible apartar tiempo para esos horarios de hoy. "
+                        f"Informa al usuario que ya no se puede apartar tiempo para hoy debido a que el horario ya pasó, y procede a ofrecerle revisar la disponibilidad para mañana ({tomorrow_date}) si lo desea."
+                    )
+                else:
+                    note = (
+                        f"Hora de la consulta: {current_time_str}. Quedan {len(available_slots)} hueco(s) de trabajo disponible(s) hoy a partir de este momento. "
+                        f"{len(past_slots)} bloque(s) previos ya pasaron y no se pueden apartar."
+                    )
+
                 return {
                     "success": True,
                     "date": target_date.isoformat(),
+                    "is_today": True,
+                    "current_time": current_time_str,
                     "min_duration_minutes": duration_minutes,
-                    "total_slots": len(slots),
-                    "free_slots": slots
+                    "total_slots": len(available_slots),
+                    "free_slots": available_slots,
+                    "past_slots": past_slots,
+                    "day_ended": day_ended,
+                    "suggested_next_date": tomorrow_date,
+                    "message": note
                 }
             except GoogleCalendarNotConnected:
                 return {
@@ -250,6 +400,19 @@ class ScheduleDeepWorkTool(BaseTool):
                     continue
 
             if not selected_slot or not slot_start_dt:
+                is_today = (t_date == now_col.date())
+                tomorrow_date = (t_date + timedelta(days=1)).isoformat()
+                if is_today:
+                    return {
+                        "success": False,
+                        "error": f"No hay ningún bloque libre disponible de al menos {duration_minutes} minutos para lo que queda de hoy ({now_col.strftime('%H:%M')}), ya que los horarios previos ya transcurrieron.",
+                        "is_today": True,
+                        "current_time": now_col.strftime("%H:%M"),
+                        "day_ended": True,
+                        "suggested_next_date": tomorrow_date,
+                        "suggestion": f"Informa al usuario que ya no hay disponibilidad hoy porque los horarios ya pasaron, y pregúntale si desea programar el bloque de Deep Work para mañana ({tomorrow_date}).",
+                        "available_slots": slots
+                    }
                 return {
                     "success": False,
                     "error": f"No hay ningún bloque libre disponible de al menos {duration_minutes} minutos en {t_date.isoformat()}.",

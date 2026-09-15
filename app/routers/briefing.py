@@ -9,8 +9,9 @@ from sqlalchemy import select
 
 from app.core.auth import get_current_user
 from app.core.timezone import COLOMBIA_TZ, get_colombia_now
-from app.db.session import get_db, AsyncSessionLocal
+from app.db.session import get_db
 from app.models.reminder import Reminder
+from app.models.user_preference import UserPreference
 from app.schemas.briefing import BriefingResponse
 from app.services.google_calendar import google_calendar_service
 from app.services.tools.weather import WeatherTool
@@ -59,17 +60,27 @@ async def get_daily_briefing(
 ):
     """
     Daily Standup & Executive Briefing:
-    Aggregates current weather (using user coordinates or specified city), Google Calendar schedule,
-    critical/high-priority tasks, and available Deep Work focus slots for today.
+    Aggregates current weather (using user coordinates, specified city or saved preference),
+    Google Calendar schedule, detected meeting conflicts, critical/high-priority tasks,
+    overdue tasks, and available Deep Work focus slots for today.
     """
     now_col = get_colombia_now()
     today = now_col.date()
     day_start = datetime(today.year, today.month, today.day, 0, 0, 0, tzinfo=COLOMBIA_TZ)
     day_end = datetime(today.year, today.month, today.day, 23, 59, 59, tzinfo=COLOMBIA_TZ)
 
-    # 1. Check calendar integration and query pending reminders from db
+    # 1. Check calendar integration, user preferences and query pending reminders from db
     integration = await google_calendar_service.get_user_integration(current_user, db)
     calendar_connected = integration is not None
+
+    user_pref = None
+    try:
+        pref_stmt = select(UserPreference).where(UserPreference.user_id == current_user)
+        pref_res = await db.execute(pref_stmt)
+        user_pref = pref_res.scalar_one_or_none()
+    except Exception as e:
+        logger.warning(f"Error consultando preferencias de usuario en briefing: {e}")
+        await db.rollback()
 
     stmt = (
         select(Reminder)
@@ -97,29 +108,41 @@ async def get_daily_briefing(
     async def fetch_weather():
         tool = WeatherTool()
         is_default = False
+        target_city = city.strip() if (city and city.strip()) else (user_pref.city if user_pref and user_pref.city else None)
+
         if lat is not None and lon is not None:
             res = await tool.execute(latitude=lat, longitude=lon)
-        elif city and city.strip():
-            res = await tool.execute(city=city.strip())
+        elif target_city:
+            res = await tool.execute(city=target_city)
         else:
-            is_default = True
-            res = await tool.execute(city="Bogotá")
+            # No location provided and no saved city preference - DO NOT default to Bogotá
+            return {
+                "city": None,
+                "country": "",
+                "temp": None,
+                "description": "Ubicación no configurada",
+                "is_default_location": False,
+                "location_required": True,
+                "message": "Para mostrar el clima en tu Daily Briefing, permite el acceso a tu ubicación o configura tu ciudad en preferencias."
+            }
 
         if "error" in res:
             return {
-                "city": res.get("city") or city or "Ubicación desconocida",
+                "city": res.get("city") or target_city or "Ubicación desconocida",
                 "country": "",
                 "temp": None,
                 "description": res.get("error"),
-                "is_default_location": is_default
+                "is_default_location": is_default,
+                "location_required": False
             }
 
         return {
-            "city": res.get("city") or city or "Ubicación actual",
+            "city": res.get("city") or target_city or "Ubicación actual",
             "country": res.get("country", ""),
             "temp": round(res["temperature"]) if res.get("temperature") is not None else None,
             "description": res.get("description"),
-            "is_default_location": is_default
+            "is_default_location": is_default,
+            "location_required": False
         }
 
     # Parallel execution of external integrations
@@ -128,12 +151,22 @@ async def get_daily_briefing(
         fetch_weather()
     )
 
-    # 3. Calculate free slots using retrieved calendar events
+    # 3. Detect meeting conflicts in calendar
+    conflicts = google_calendar_service.detect_conflicts(events_today) if calendar_connected else []
+
+    # 4. Calculate free slots using retrieved calendar events and user workday/buffer preferences
+    workday_start = user_pref.workday_start_hour if user_pref else 8
+    workday_end = user_pref.workday_end_hour if user_pref else 19
+    buffer_min = user_pref.buffer_minutes if user_pref else 0
+
     if calendar_connected:
         free_slots = await google_calendar_service.find_free_slots(
             user_id=current_user,
             target_date=today,
             min_duration_minutes=60,
+            workday_start_hour=workday_start,
+            workday_end_hour=workday_end,
+            buffer_minutes=buffer_min,
             events=events_today
         )
     else:
@@ -152,6 +185,20 @@ async def get_daily_briefing(
         if r.priority == "high"
     ]
 
+    # 5. Detect overdue tasks from previous days
+    overdue_tasks = [
+        {
+            "id": str(r.id),
+            "description": r.description,
+            "due_date": r.due_date.isoformat() if r.due_date else None,
+            "project": r.project,
+            "priority": r.priority,
+            "estimated_minutes": r.estimated_minutes
+        }
+        for r in reminders
+        if r.due_date and r.due_date < day_start
+    ]
+
     free_slots_summary = _generate_slots_summary(free_slots, calendar_connected)
 
     return BriefingResponse(
@@ -161,5 +208,9 @@ async def get_daily_briefing(
         events_today=events_today,
         critical_tasks=critical_tasks,
         pending_tasks_count=len(reminders),
-        free_slots_summary=free_slots_summary
+        free_slots_summary=free_slots_summary,
+        conflicts=conflicts,
+        has_conflicts=len(conflicts) > 0,
+        overdue_tasks=overdue_tasks,
+        total_overdue_tasks=len(overdue_tasks)
     )
